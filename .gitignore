@@ -1,4 +1,9 @@
 .prog
+cron-scheduler
+scheduler.db
+scheduler.db-shm
+scheduler.db-wal
+logs/
 *.class
 __pycache__/
 node_modules/

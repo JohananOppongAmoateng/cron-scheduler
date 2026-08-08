@@ -1,473 +1,708 @@
-#include <ctype.h>
+#define _POSIX_C_SOURCE 200809L
+
+#include "cron.h"
+
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
-struct datetime {
-    int year, month, day, hour, minute, second;
-};
-
-struct cron {
-    unsigned char minute[60], hour[24], day[31], month[12], weekday[8];
-    int day_wildcard, weekday_wildcard;
-};
-
-enum policy {
+enum job_policy {
     POLICY_SKIP,
     POLICY_CATCHUP,
     POLICY_LIMITED
 };
 
 struct job {
-    char id[64];
-    char cron_text[256];
-    char command[256];
-    struct cron cron;
-    enum policy policy;
+    char* id;
+    char* expression;
+    char* command;
+    struct cron_schedule schedule;
+    enum job_policy policy;
     size_t catchup_limit;
-    int active;
     int max_overlap;
-    struct datetime added_at;
-    struct datetime last_processed;
-    int has_last_processed;
+    time_t last_processed;
 };
 
-static int parse_number(const char* text, int* value) {
-    char* end;
-    errno = 0;
-    long parsed = strtol(text, &end, 10);
-    if (errno || *text == '\0' || *end != '\0' ||
-        parsed < INT_MIN || parsed > INT_MAX) {
+static volatile sig_atomic_t stop_requested;
+static volatile sig_atomic_t reload_requested;
+static volatile sig_atomic_t child_changed;
+
+static void handle_signal(int signal_number) {
+    if (signal_number == SIGTERM || signal_number == SIGINT) {
+        stop_requested = 1;
+    } else if (signal_number == SIGHUP) {
+        reload_requested = 1;
+    } else if (signal_number == SIGCHLD) {
+        child_changed = 1;
+    }
+}
+
+static int execute_sql(sqlite3* db, const char* sql) {
+    char* error = NULL;
+    if (sqlite3_exec(db, sql, NULL, NULL, &error) != SQLITE_OK) {
+        fprintf(stderr, "sqlite: %s\n", error ? error : sqlite3_errmsg(db));
+        sqlite3_free(error);
         return 0;
     }
-    *value = (int)parsed;
     return 1;
 }
 
-static int expand_part(char* part, int min, int max, unsigned char* values) {
-    int first, last, step = 1;
-    char* slash = strchr(part, '/');
-    if (slash) {
-        if (strchr(slash + 1, '/')) return 0;
-        *slash++ = '\0';
-        if (!parse_number(slash, &step) || step <= 0) return 0;
+static sqlite3* open_database(const char* path) {
+    sqlite3* db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) {
+        fprintf(stderr, "cannot open database %s: %s\n",
+                path, db ? sqlite3_errmsg(db) : "out of memory");
+        sqlite3_close(db);
+        return NULL;
+    }
+    sqlite3_busy_timeout(db, 5000);
+
+    const char* schema =
+        "PRAGMA journal_mode=WAL;"
+        "PRAGMA foreign_keys=ON;"
+        "CREATE TABLE IF NOT EXISTS jobs ("
+        " id TEXT PRIMARY KEY,"
+        " cron TEXT NOT NULL,"
+        " policy TEXT NOT NULL CHECK(policy IN ('skip','catchup','limited')),"
+        " catchup_limit INTEGER NOT NULL DEFAULT 0 CHECK(catchup_limit >= 0),"
+        " max_overlap INTEGER NOT NULL CHECK(max_overlap > 0),"
+        " command TEXT NOT NULL,"
+        " enabled INTEGER NOT NULL DEFAULT 1,"
+        " created_seq INTEGER NOT NULL,"
+        " last_processed INTEGER NOT NULL"
+        ");"
+        "CREATE TABLE IF NOT EXISTS runs ("
+        " run_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " job_id TEXT NOT NULL,"
+        " scheduled_at INTEGER NOT NULL,"
+        " started_at INTEGER,"
+        " finished_at INTEGER,"
+        " pid INTEGER,"
+        " status TEXT NOT NULL,"
+        " exit_code INTEGER,"
+        " log_path TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS runs_job_status"
+        " ON runs(job_id, status);";
+    if (!execute_sql(db, schema)) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    return db;
+}
+
+static char* duplicate_column(sqlite3_stmt* statement, int column) {
+    const unsigned char* text = sqlite3_column_text(statement, column);
+    return text ? strdup((const char*)text) : NULL;
+}
+
+static void free_jobs(struct job* jobs, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        free(jobs[i].id);
+        free(jobs[i].expression);
+        free(jobs[i].command);
+    }
+    free(jobs);
+}
+
+static int parse_policy(const char* text, enum job_policy* policy,
+                        size_t* limit) {
+    if (strcmp(text, "skip") == 0) {
+        *policy = POLICY_SKIP;
+        *limit = 1;
+        return 1;
+    }
+    if (strcmp(text, "catchup") == 0) {
+        *policy = POLICY_CATCHUP;
+        *limit = 0;
+        return 1;
+    }
+    if (strncmp(text, "catchup:", 8) == 0) {
+        char* end;
+        errno = 0;
+        unsigned long parsed = strtoul(text + 8, &end, 10);
+        if (!errno && text[8] != '\0' && *end == '\0') {
+            *policy = POLICY_LIMITED;
+            *limit = (size_t)parsed;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const char* policy_name(enum job_policy policy) {
+    if (policy == POLICY_SKIP) return "skip";
+    if (policy == POLICY_CATCHUP) return "catchup";
+    return "limited";
+}
+
+static int load_jobs(sqlite3* db, struct job** output, size_t* output_count) {
+    const char* sql =
+        "SELECT id, cron, command, policy, catchup_limit, max_overlap,"
+        " last_processed FROM jobs WHERE enabled=1 ORDER BY created_seq";
+    sqlite3_stmt* statement = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &statement, NULL) != SQLITE_OK) {
+        fprintf(stderr, "sqlite: %s\n", sqlite3_errmsg(db));
+        return 0;
     }
 
-    if (strcmp(part, "*") == 0) {
-        first = min;
-        last = max;
-    } else if (parse_number(part, &first)) {
-        last = slash ? max : first;
-    } else {
-        char trailing;
-        if (sscanf(part, "%d-%d%c", &first, &last, &trailing) != 2 ||
-            first > last) {
+    struct job* jobs = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    int result;
+    while ((result = sqlite3_step(statement)) == SQLITE_ROW) {
+        if (count == capacity) {
+            size_t new_capacity = capacity ? capacity * 2 : 8;
+            struct job* resized = realloc(jobs, new_capacity * sizeof *jobs);
+            if (!resized) {
+                free_jobs(jobs, count);
+                sqlite3_finalize(statement);
+                return 0;
+            }
+            jobs = resized;
+            capacity = new_capacity;
+        }
+
+        struct job* job = &jobs[count];
+        memset(job, 0, sizeof *job);
+        job->id = duplicate_column(statement, 0);
+        job->expression = duplicate_column(statement, 1);
+        job->command = duplicate_column(statement, 2);
+        const char* stored_policy =
+            (const char*)sqlite3_column_text(statement, 3);
+        job->catchup_limit = (size_t)sqlite3_column_int64(statement, 4);
+        job->max_overlap = sqlite3_column_int(statement, 5);
+        job->last_processed =
+            (time_t)sqlite3_column_int64(statement, 6);
+
+        if (!job->id || !job->expression || !job->command ||
+            !cron_parse(job->expression, &job->schedule)) {
+            fprintf(stderr, "invalid persisted job at row %zu\n", count + 1);
+            free_jobs(jobs, count + 1);
+            sqlite3_finalize(statement);
+            return 0;
+        }
+        if (strcmp(stored_policy, "skip") == 0) {
+            job->policy = POLICY_SKIP;
+        } else if (strcmp(stored_policy, "catchup") == 0) {
+            job->policy = POLICY_CATCHUP;
+        } else {
+            job->policy = POLICY_LIMITED;
+        }
+        count++;
+    }
+    sqlite3_finalize(statement);
+    if (result != SQLITE_DONE) {
+        fprintf(stderr, "sqlite: %s\n", sqlite3_errmsg(db));
+        free_jobs(jobs, count);
+        return 0;
+    }
+    *output = jobs;
+    *output_count = count;
+    return 1;
+}
+
+static int valid_job_id(const char* id) {
+    if (!*id) return 0;
+    for (const unsigned char* p = (const unsigned char*)id; *p; p++) {
+        if (!(('a' <= *p && *p <= 'z') ||
+              ('A' <= *p && *p <= 'Z') ||
+              ('0' <= *p && *p <= '9') ||
+              *p == '_' || *p == '-' || *p == '.')) {
             return 0;
         }
     }
-    if (first < min || last > max) return 0;
-
-    for (int value = first; value <= last; value += step) {
-        values[value - min] = 1;
-        if (value > last - step) break;
-    }
     return 1;
 }
 
-static int expand_field(char* field, int min, int max, unsigned char* values) {
-    char* part = field;
-    if (*part == '\0') return 0;
-    for (;;) {
-        char* comma = strchr(part, ',');
-        if (comma) *comma = '\0';
-        if (*part == '\0' || !expand_part(part, min, max, values)) return 0;
-        if (!comma) return 1;
-        part = comma + 1;
+static char* join_arguments(int argc, char** argv, int start) {
+    size_t length = 1;
+    for (int i = start; i < argc; i++) length += strlen(argv[i]) + 1;
+    char* joined = malloc(length);
+    if (!joined) return NULL;
+    joined[0] = '\0';
+    for (int i = start; i < argc; i++) {
+        if (i > start) strcat(joined, " ");
+        strcat(joined, argv[i]);
     }
+    return joined;
 }
 
-static int parse_cron(const char* text, struct cron* cron) {
-    char fields[5][64], trailing;
-    if (sscanf(text, " %63s %63s %63s %63s %63s %c",
-               fields[0], fields[1], fields[2], fields[3], fields[4],
-               &trailing) != 5) {
+static int add_job(sqlite3* db, int argc, char** argv, int index) {
+    if (argc - index < 5) {
+        fprintf(stderr,
+                "usage: add <id> <cron> <policy> <max_overlap> <command...>\n");
         return 0;
     }
-    memset(cron, 0, sizeof *cron);
-    cron->day_wildcard = strcmp(fields[2], "*") == 0;
-    cron->weekday_wildcard = strcmp(fields[4], "*") == 0;
-    return expand_field(fields[0], 0, 59, cron->minute) &&
-           expand_field(fields[1], 0, 23, cron->hour) &&
-           expand_field(fields[2], 1, 31, cron->day) &&
-           expand_field(fields[3], 1, 12, cron->month) &&
-           expand_field(fields[4], 0, 7, cron->weekday);
-}
 
-static int is_leap(int year) {
-    return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-}
+    const char* id = argv[index];
+    const char* expression = argv[index + 1];
+    const char* policy_text = argv[index + 2];
+    char* end;
+    errno = 0;
+    long max_overlap = strtol(argv[index + 3], &end, 10);
+    struct cron_schedule schedule;
+    enum job_policy policy;
+    size_t catchup_limit;
+    char* command = join_arguments(argc, argv, index + 4);
 
-static int days_in_month(int year, int month) {
-    static const int days[] =
-        {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    return month == 2 && is_leap(year) ? 29 : days[month - 1];
-}
-
-static int parse_digits(const char* text, int count) {
-    int value = 0;
-    for (int i = 0; i < count; i++) {
-        if (!isdigit((unsigned char)text[i])) return -1;
-        value = value * 10 + text[i] - '0';
-    }
-    return value;
-}
-
-static int parse_datetime(const char* text, struct datetime* date) {
-    if (strlen(text) != 19 || text[4] != '-' || text[7] != '-' ||
-        text[10] != 'T' || text[13] != ':' || text[16] != ':') {
+    if (!valid_job_id(id) || !cron_parse(expression, &schedule) ||
+        !parse_policy(policy_text, &policy, &catchup_limit) ||
+        errno || *end != '\0' || max_overlap <= 0 || max_overlap > INT_MAX ||
+        !command || !*command) {
+        fprintf(stderr, "invalid job definition\n");
+        free(command);
         return 0;
     }
-    date->year = parse_digits(text, 4);
-    date->month = parse_digits(text + 5, 2);
-    date->day = parse_digits(text + 8, 2);
-    date->hour = parse_digits(text + 11, 2);
-    date->minute = parse_digits(text + 14, 2);
-    date->second = parse_digits(text + 17, 2);
-    return date->year >= 1 && date->month >= 1 && date->month <= 12 &&
-           date->day >= 1 &&
-           date->day <= days_in_month(date->year, date->month) &&
-           date->hour >= 0 && date->hour < 24 &&
-           date->minute >= 0 && date->minute < 60 &&
-           date->second >= 0 && date->second < 60;
-}
 
-static int compare_datetime(const struct datetime* a,
-                            const struct datetime* b) {
-    const int left[] =
-        {a->year, a->month, a->day, a->hour, a->minute, a->second};
-    const int right[] =
-        {b->year, b->month, b->day, b->hour, b->minute, b->second};
-    for (int i = 0; i < 6; i++) {
-        if (left[i] != right[i]) return left[i] < right[i] ? -1 : 1;
+    const char* sql =
+        "INSERT INTO jobs"
+        " (id,cron,policy,catchup_limit,max_overlap,command,enabled,"
+        "  created_seq,last_processed)"
+        " VALUES (?1,?2,?3,?4,?5,?6,1,"
+        "  COALESCE((SELECT created_seq FROM jobs WHERE id=?1),"
+        "           (SELECT COALESCE(MAX(created_seq),0)+1 FROM jobs)),?7)"
+        " ON CONFLICT(id) DO UPDATE SET"
+        " cron=excluded.cron, policy=excluded.policy,"
+        " catchup_limit=excluded.catchup_limit,"
+        " max_overlap=excluded.max_overlap, command=excluded.command,"
+        " enabled=1, last_processed=excluded.last_processed";
+    sqlite3_stmt* statement = NULL;
+    int ok = sqlite3_prepare_v2(db, sql, -1, &statement, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(statement, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, expression, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 3, policy_name(policy), -1,
+                          SQLITE_STATIC);
+        sqlite3_bind_int64(statement, 4, (sqlite3_int64)catchup_limit);
+        sqlite3_bind_int(statement, 5, (int)max_overlap);
+        sqlite3_bind_text(statement, 6, command, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(statement, 7, (sqlite3_int64)time(NULL));
+        ok = sqlite3_step(statement) == SQLITE_DONE;
     }
-    return 0;
+    if (!ok) fprintf(stderr, "sqlite: %s\n", sqlite3_errmsg(db));
+    sqlite3_finalize(statement);
+    free(command);
+    return ok;
 }
 
-static void add_minute(struct datetime* date) {
-    date->second = 0;
-    if (++date->minute < 60) return;
-    date->minute = 0;
-    if (++date->hour < 24) return;
-    date->hour = 0;
-    if (++date->day <= days_in_month(date->year, date->month)) return;
-    date->day = 1;
-    if (++date->month <= 12) return;
-    date->month = 1;
-    date->year++;
-}
-
-static int weekday(const struct datetime* date) {
-    static const int offsets[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
-    int year = date->year - (date->month < 3);
-    return (year + year / 4 - year / 100 + year / 400 +
-            offsets[date->month - 1] + date->day) % 7;
-}
-
-static int cron_matches(const struct cron* cron, const struct datetime* date) {
-    if (!cron->minute[date->minute] || !cron->hour[date->hour] ||
-        !cron->month[date->month - 1]) {
+static int list_jobs(sqlite3* db) {
+    const char* sql =
+        "SELECT id,cron,"
+        " CASE policy WHEN 'limited' THEN 'catchup:'||catchup_limit"
+        " ELSE policy END,max_overlap,command,last_processed"
+        " FROM jobs ORDER BY created_seq";
+    sqlite3_stmt* statement = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &statement, NULL) != SQLITE_OK) {
+        fprintf(stderr, "sqlite: %s\n", sqlite3_errmsg(db));
         return 0;
     }
-    int day_matches = cron->day[date->day - 1];
-    int day_of_week = weekday(date);
-    int weekday_matches = cron->weekday[day_of_week] ||
-                          (day_of_week == 0 && cron->weekday[7]);
-    if (!cron->day_wildcard && !cron->weekday_wildcard) {
-        return day_matches || weekday_matches;
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        char iso[32];
+        format_iso_utc((time_t)sqlite3_column_int64(statement, 5),
+                       iso, sizeof iso);
+        printf("%s | %s | %s | max=%d | %s | last=%s\n",
+               sqlite3_column_text(statement, 0),
+               sqlite3_column_text(statement, 1),
+               sqlite3_column_text(statement, 2),
+               sqlite3_column_int(statement, 3),
+               sqlite3_column_text(statement, 4), iso);
     }
-    if (!cron->day_wildcard) return day_matches;
-    if (!cron->weekday_wildcard) return weekday_matches;
+    sqlite3_finalize(statement);
     return 1;
 }
 
-static int next_run(const struct cron* cron, const struct datetime* after,
-                    struct datetime* next) {
-    *next = *after;
-    add_minute(next);
-    int end_year = after->year + 4;
-    while (next->year <= end_year) {
-        if (cron_matches(cron, next)) return 1;
-        add_minute(next);
-    }
-    return 0;
-}
-
-static int find_job(const struct job* jobs, size_t count, const char* id) {
-    for (size_t i = 0; i < count; i++) {
-        if (strcmp(jobs[i].id, id) == 0) return (int)i;
-    }
-    return -1;
-}
-
-static void print_datetime(const struct datetime* date) {
-    printf("%04d-%02d-%02dT%02d:%02d:%02d",
-           date->year, date->month, date->day,
-           date->hour, date->minute, date->second);
-}
-
-static int parse_job_args(char* text, const struct datetime* now,
-                          struct job* job) {
-    char* p = text;
-    while (isspace((unsigned char)*p)) p++;
-    char* id = p;
-    while (*p && !isspace((unsigned char)*p)) p++;
-    if (*p) *p++ = '\0';
-    while (isspace((unsigned char)*p)) p++;
-    if (*id == '\0' || strlen(id) >= sizeof job->id || *p != '"') return 0;
-
-    char* cron_text = ++p;
-    char* quote = strchr(p, '"');
-    if (!quote) return 0;
-    *quote = '\0';
-    p = quote + 1;
-    while (isspace((unsigned char)*p)) p++;
-
-    char* policy_text = p;
-    while (*p && !isspace((unsigned char)*p)) p++;
-    if (*p) *p++ = '\0';
-    while (isspace((unsigned char)*p)) p++;
-
-    char* overlap_text = p;
-    while (*p && !isspace((unsigned char)*p)) p++;
-    if (*p) *p++ = '\0';
-    while (isspace((unsigned char)*p)) p++;
-
-    if (strcmp(policy_text, "skip") == 0) {
-        job->policy = POLICY_SKIP;
-        job->catchup_limit = 1;
-    } else if (strcmp(policy_text, "catchup") == 0) {
-        job->policy = POLICY_CATCHUP;
-        job->catchup_limit = 0;
-    } else if (strncmp(policy_text, "catchup:", 8) == 0) {
-        int limit;
-        if (!parse_number(policy_text + 8, &limit) || limit < 0) return 0;
-        job->policy = POLICY_LIMITED;
-        job->catchup_limit = (size_t)limit;
-    } else {
+static int remove_job(sqlite3* db, const char* id) {
+    sqlite3_stmt* statement = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM jobs WHERE id=?1", -1,
+                           &statement, NULL) != SQLITE_OK) {
         return 0;
     }
+    sqlite3_bind_text(statement, 1, id, -1, SQLITE_TRANSIENT);
+    int ok = sqlite3_step(statement) == SQLITE_DONE &&
+             sqlite3_changes(db) > 0;
+    sqlite3_finalize(statement);
+    if (!ok) fprintf(stderr, "no such job: %s\n", id);
+    return ok;
+}
 
-    if (!parse_number(overlap_text, &job->max_overlap) ||
-        job->max_overlap <= 0 || *p == '\0' ||
-        strlen(cron_text) >= sizeof job->cron_text ||
-        strlen(p) >= sizeof job->command ||
-        !parse_cron(cron_text, &job->cron)) {
+static int list_runs(sqlite3* db, const char* id) {
+    const char* sql_all =
+        "SELECT run_id,job_id,scheduled_at,status,exit_code,log_path"
+        " FROM runs ORDER BY run_id";
+    const char* sql_one =
+        "SELECT run_id,job_id,scheduled_at,status,exit_code,log_path"
+        " FROM runs WHERE job_id=?1 ORDER BY run_id";
+    sqlite3_stmt* statement = NULL;
+    if (sqlite3_prepare_v2(db, id ? sql_one : sql_all, -1,
+                           &statement, NULL) != SQLITE_OK) {
         return 0;
     }
-
-    snprintf(job->id, sizeof job->id, "%s", id);
-    snprintf(job->cron_text, sizeof job->cron_text, "%s", cron_text);
-    snprintf(job->command, sizeof job->command, "%s", p);
-    job->active = 0;
-    job->added_at = *now;
-    job->has_last_processed = 0;
+    if (id) sqlite3_bind_text(statement, 1, id, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        char iso[32];
+        format_iso_utc((time_t)sqlite3_column_int64(statement, 2),
+                       iso, sizeof iso);
+        printf("%lld | %s | %s | %s",
+               sqlite3_column_int64(statement, 0),
+               sqlite3_column_text(statement, 1), iso,
+               sqlite3_column_text(statement, 3));
+        if (sqlite3_column_type(statement, 4) != SQLITE_NULL) {
+            printf(" | exit=%d", sqlite3_column_int(statement, 4));
+        }
+        if (sqlite3_column_type(statement, 5) != SQLITE_NULL) {
+            printf(" | %s", sqlite3_column_text(statement, 5));
+        }
+        printf("\n");
+    }
+    sqlite3_finalize(statement);
     return 1;
 }
 
-static int append_datetime(struct datetime** dates, size_t* count,
-                           size_t* capacity, const struct datetime* date) {
-    if (*count == *capacity) {
-        size_t new_capacity = *capacity ? *capacity * 2 : 8;
-        struct datetime* resized =
-            realloc(*dates, new_capacity * sizeof **dates);
-        if (!resized) return 0;
-        *dates = resized;
-        *capacity = new_capacity;
+static int update_finished_run(sqlite3* db, pid_t pid, int status) {
+    const char* sql =
+        "UPDATE runs SET status=?1,exit_code=?2,finished_at=?3"
+        " WHERE pid=?4 AND status='running'";
+    sqlite3_stmt* statement = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &statement, NULL) != SQLITE_OK) {
+        return 0;
     }
-    (*dates)[(*count)++] = *date;
-    return 1;
+    int exit_code = WIFEXITED(status) ? WEXITSTATUS(status)
+                                     : 128 + WTERMSIG(status);
+    sqlite3_bind_text(statement, 1, exit_code == 0 ? "succeeded" : "failed",
+                      -1, SQLITE_STATIC);
+    sqlite3_bind_int(statement, 2, exit_code);
+    sqlite3_bind_int64(statement, 3, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int64(statement, 4, (sqlite3_int64)pid);
+    int ok = sqlite3_step(statement) == SQLITE_DONE;
+    sqlite3_finalize(statement);
+    return ok;
 }
 
-static int compare_job_pointers(const void* left, const void* right) {
-    const struct job* const* a = left;
-    const struct job* const* b = right;
-    return strcmp((*a)->id, (*b)->id);
+static void reap_children(sqlite3* db, int blocking) {
+    int status;
+    pid_t pid;
+    int options = blocking ? 0 : WNOHANG;
+    while ((pid = waitpid(-1, &status, options)) > 0) {
+        update_finished_run(db, pid, status);
+        options = blocking ? 0 : WNOHANG;
+    }
+    child_changed = 0;
 }
 
-int main(void) {
-    char line[512];
-    struct datetime now = {0};
-    int has_now = 0;
-    struct job* jobs = NULL;
-    size_t job_count = 0, job_capacity = 0;
-
-    while (fgets(line, sizeof line, stdin)) {
-        line[strcspn(line, "\r\n")] = '\0';
-
-        if (strncmp(line, "NOW ", 4) == 0) {
-            char iso[64], trailing;
-            if (sscanf(line, "NOW %63s %c", iso, &trailing) != 1 ||
-                !parse_datetime(iso, &now)) {
-                printf("ERR\n");
-            } else {
-                has_now = 1;
+static void reconcile_running(sqlite3* db) {
+    sqlite3_stmt* query = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT DISTINCT pid FROM runs"
+            " WHERE status='running' AND pid IS NOT NULL",
+            -1, &query, NULL) != SQLITE_OK) {
+        return;
+    }
+    while (sqlite3_step(query) == SQLITE_ROW) {
+        pid_t pid = (pid_t)sqlite3_column_int64(query, 0);
+        if (kill(pid, 0) < 0 && errno == ESRCH) {
+            sqlite3_stmt* update = NULL;
+            if (sqlite3_prepare_v2(db,
+                    "UPDATE runs SET status='lost',finished_at=?1"
+                    " WHERE pid=?2 AND status='running'",
+                    -1, &update, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(update, 1, (sqlite3_int64)time(NULL));
+                sqlite3_bind_int64(update, 2, (sqlite3_int64)pid);
+                sqlite3_step(update);
             }
-        } else if (strncmp(line, "ADD ", 4) == 0) {
-            if (!has_now) {
-                printf("ERR\n");
-                continue;
-            }
-
-            if (job_count == job_capacity) {
-                size_t capacity = job_capacity ? job_capacity * 2 : 8;
-                struct job* resized =
-                    realloc(jobs, capacity * sizeof *jobs);
-                if (!resized) {
-                    printf("ERR\n");
-                    continue;
-                }
-                jobs = resized;
-                job_capacity = capacity;
-            }
-            if (!parse_job_args(line + 4, &now, &jobs[job_count])) {
-                printf("ERR\n");
-                continue;
-            }
-            job_count++;
-        } else if (strcmp(line, "TICK") == 0) {
-            if (!has_now) {
-                printf("ERR\n");
-                continue;
-            }
-
-            for (size_t i = 0; i < job_count; i++) {
-                struct job* job = &jobs[i];
-                struct datetime cursor = job->has_last_processed
-                                             ? job->last_processed
-                                             : job->added_at;
-                struct datetime occurrence;
-                struct datetime* occurrences = NULL;
-                size_t count = 0, capacity = 0;
-
-                while (next_run(&job->cron, &cursor, &occurrence) &&
-                       compare_datetime(&occurrence, &now) <= 0) {
-                    if (!append_datetime(&occurrences, &count, &capacity,
-                                         &occurrence)) {
-                        free(occurrences);
-                        free(jobs);
-                        return 1;
-                    }
-                    cursor = occurrence;
-                }
-
-                size_t first = 0;
-                if (job->policy == POLICY_SKIP && count > 1) {
-                    first = count - 1;
-                } else if (job->policy == POLICY_LIMITED &&
-                           count > job->catchup_limit) {
-                    first = count - job->catchup_limit;
-                }
-
-                for (size_t j = first; j < count; j++) {
-                    if (job->active < job->max_overlap) {
-                        job->active++;
-                        printf("RAN %s for ", job->id);
-                    } else {
-                        printf("SKIP %s for ", job->id);
-                    }
-                    print_datetime(&occurrences[j]);
-                    printf("\n");
-                }
-                if (first < count) {
-                    job->last_processed = occurrences[count - 1];
-                    job->has_last_processed = 1;
-                }
-                free(occurrences);
-            }
-            printf("OK\n");
-        } else if (strncmp(line, "COMPLETE ", 9) == 0) {
-            char id[64], trailing;
-            if (sscanf(line, "COMPLETE %63s %c", id, &trailing) != 1) {
-                printf("ERR\n");
-                continue;
-            }
-            int index = find_job(jobs, job_count, id);
-            if (index < 0) {
-                printf("ERR\n");
-            } else if (jobs[index].active > 0) {
-                jobs[index].active--;
-            }
-        } else if (strcmp(line, "PERSIST") == 0) {
-            struct job** sorted = malloc(job_count * sizeof *sorted);
-            if (!sorted && job_count) {
-                printf("ERR\n");
-                continue;
-            }
-            for (size_t i = 0; i < job_count; i++) sorted[i] = &jobs[i];
-            if (job_count > 1) {
-                qsort(sorted, job_count, sizeof *sorted,
-                      compare_job_pointers);
-            }
-            for (size_t i = 0; i < job_count; i++) {
-                struct datetime next;
-                printf("{\"id\":\"%s\",\"cron\":\"%s\",\"last_run\":",
-                       sorted[i]->id, sorted[i]->cron_text);
-                if (sorted[i]->has_last_processed) {
-                    printf("\"");
-                    print_datetime(&sorted[i]->last_processed);
-                    printf("\"");
-                } else {
-                    printf("null");
-                }
-                printf(",\"next_run\":\"");
-                if (next_run(&sorted[i]->cron, &now, &next)) {
-                    print_datetime(&next);
-                } else {
-                    printf("NEVER");
-                }
-                printf("\"}\n");
-            }
-            free(sorted);
-        } else if (strncmp(line, "RELOAD ", 7) == 0) {
-            int reload_count;
-            char trailing;
-            if (!has_now ||
-                sscanf(line, "RELOAD %d %c", &reload_count, &trailing) != 1 ||
-                reload_count < 0) {
-                printf("ERR\n");
-                continue;
-            }
-
-            free(jobs);
-            jobs = NULL;
-            job_count = 0;
-            job_capacity = (size_t)reload_count;
-            if (job_capacity) {
-                jobs = malloc(job_capacity * sizeof *jobs);
-                if (!jobs) return 1;
-            }
-
-            int valid = 1;
-            for (int i = 0; i < reload_count; i++) {
-                if (!fgets(line, sizeof line, stdin)) {
-                    valid = 0;
-                    break;
-                }
-                line[strcspn(line, "\r\n")] = '\0';
-                if (!parse_job_args(line, &now, &jobs[job_count])) {
-                    valid = 0;
-                } else {
-                    job_count++;
-                }
-            }
-            if (!valid) printf("ERR\n");
-        } else {
-            printf("ERR\n");
+            sqlite3_finalize(update);
         }
     }
+    sqlite3_finalize(query);
+}
 
-    free(jobs);
-    return 0;
+static int active_runs(sqlite3* db, const char* job_id) {
+    sqlite3_stmt* statement = NULL;
+    int count = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT COUNT(*) FROM runs"
+            " WHERE job_id=?1 AND status='running'",
+            -1, &statement, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(statement, 1, job_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(statement) == SQLITE_ROW) {
+            count = sqlite3_column_int(statement, 0);
+        }
+    }
+    sqlite3_finalize(statement);
+    return count;
+}
+
+static int record_skipped(sqlite3* db, const char* job_id,
+                          time_t scheduled) {
+    const char* sql =
+        "INSERT INTO runs(job_id,scheduled_at,finished_at,status)"
+        " VALUES(?1,?2,?3,'overlap_skipped')";
+    sqlite3_stmt* statement = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &statement, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_text(statement, 1, job_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(statement, 2, (sqlite3_int64)scheduled);
+    sqlite3_bind_int64(statement, 3, (sqlite3_int64)time(NULL));
+    int ok = sqlite3_step(statement) == SQLITE_DONE;
+    sqlite3_finalize(statement);
+    return ok;
+}
+
+static int launch_job(sqlite3* db, const struct job* job, time_t scheduled) {
+    if (mkdir("logs", 0755) < 0 && errno != EEXIST) {
+        perror("mkdir logs");
+        return 0;
+    }
+
+    char log_path[512];
+    snprintf(log_path, sizeof log_path, "logs/%s-%lld.log",
+             job->id, (long long)scheduled);
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 0;
+    }
+    if (pid == 0) {
+        int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (log_fd < 0) _exit(126);
+        dup2(log_fd, STDOUT_FILENO);
+        dup2(log_fd, STDERR_FILENO);
+        close(log_fd);
+        execl("/bin/sh", "sh", "-c", job->command, (char*)NULL);
+        _exit(127);
+    }
+
+    const char* sql =
+        "INSERT INTO runs"
+        " (job_id,scheduled_at,started_at,pid,status,log_path)"
+        " VALUES(?1,?2,?3,?4,'running',?5)";
+    sqlite3_stmt* statement = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &statement, NULL) != SQLITE_OK) {
+        kill(pid, SIGTERM);
+        return 0;
+    }
+    sqlite3_bind_text(statement, 1, job->id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(statement, 2, (sqlite3_int64)scheduled);
+    sqlite3_bind_int64(statement, 3, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int64(statement, 4, (sqlite3_int64)pid);
+    sqlite3_bind_text(statement, 5, log_path, -1, SQLITE_TRANSIENT);
+    int ok = sqlite3_step(statement) == SQLITE_DONE;
+    sqlite3_finalize(statement);
+    if (!ok) kill(pid, SIGTERM);
+    return ok;
+}
+
+static int append_occurrence(time_t** values, size_t* count,
+                             size_t* capacity, time_t value) {
+    if (*count == *capacity) {
+        size_t new_capacity = *capacity ? *capacity * 2 : 16;
+        time_t* resized = realloc(*values, new_capacity * sizeof **values);
+        if (!resized) return 0;
+        *values = resized;
+        *capacity = new_capacity;
+    }
+    (*values)[(*count)++] = value;
+    return 1;
+}
+
+static int update_last_processed(sqlite3* db, const char* id, time_t value) {
+    sqlite3_stmt* statement = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE jobs SET last_processed=?1 WHERE id=?2",
+            -1, &statement, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_int64(statement, 1, (sqlite3_int64)value);
+    sqlite3_bind_text(statement, 2, id, -1, SQLITE_TRANSIENT);
+    int ok = sqlite3_step(statement) == SQLITE_DONE;
+    sqlite3_finalize(statement);
+    return ok;
+}
+
+static int process_due_jobs(sqlite3* db, time_t now) {
+    struct job* jobs = NULL;
+    size_t job_count = 0;
+    if (!execute_sql(db, "BEGIN IMMEDIATE")) return 0;
+    if (!load_jobs(db, &jobs, &job_count)) {
+        execute_sql(db, "ROLLBACK");
+        return 0;
+    }
+
+    int ok = 1;
+    for (size_t i = 0; i < job_count && ok; i++) {
+        struct job* job = &jobs[i];
+        time_t cursor = job->last_processed;
+        time_t occurrence;
+        time_t* occurrences = NULL;
+        size_t count = 0, capacity = 0;
+
+        while ((occurrence = cron_next(&job->schedule, cursor)) != (time_t)-1 &&
+               occurrence <= now) {
+            if (!append_occurrence(&occurrences, &count, &capacity,
+                                   occurrence)) {
+                ok = 0;
+                break;
+            }
+            cursor = occurrence;
+        }
+        if (!ok || count == 0) {
+            free(occurrences);
+            continue;
+        }
+
+        size_t first = 0;
+        if (job->policy == POLICY_SKIP) {
+            first = count - 1;
+        } else if (job->policy == POLICY_LIMITED &&
+                   count > job->catchup_limit) {
+            first = count - job->catchup_limit;
+        }
+
+        int active = active_runs(db, job->id);
+        for (size_t j = first; j < count && ok; j++) {
+            char iso[32];
+            format_iso_utc(occurrences[j], iso, sizeof iso);
+            if (active >= job->max_overlap) {
+                ok = record_skipped(db, job->id, occurrences[j]);
+                if (ok) {
+                    printf("SKIP %s for %s\n", job->id, iso);
+                    fflush(stdout);
+                }
+            } else {
+                ok = launch_job(db, job, occurrences[j]);
+                if (ok) {
+                    active++;
+                    printf("RAN %s for %s\n", job->id, iso);
+                    fflush(stdout);
+                }
+            }
+        }
+        if (ok) {
+            ok = update_last_processed(db, job->id, occurrences[count - 1]);
+        }
+        free(occurrences);
+    }
+
+    if (ok) ok = execute_sql(db, "COMMIT");
+    else execute_sql(db, "ROLLBACK");
+    free_jobs(jobs, job_count);
+    return ok;
+}
+
+static unsigned int next_sleep_seconds(sqlite3* db, time_t now) {
+    struct job* jobs = NULL;
+    size_t count = 0;
+    if (!load_jobs(db, &jobs, &count)) return 1;
+    time_t earliest = now + 60;
+    for (size_t i = 0; i < count; i++) {
+        time_t next = cron_next(&jobs[i].schedule, now);
+        if (next != (time_t)-1 && next < earliest) earliest = next;
+    }
+    free_jobs(jobs, count);
+    time_t difference = earliest - time(NULL);
+    if (difference < 1) return 1;
+    if (difference > 60) return 60;
+    return (unsigned int)difference;
+}
+
+static int run_scheduler(sqlite3* db, int once) {
+    reconcile_running(db);
+    reap_children(db, 0);
+    if (!process_due_jobs(db, time(NULL))) return 0;
+    if (once) {
+        reap_children(db, 1);
+        return 1;
+    }
+
+    while (!stop_requested) {
+        unsigned int delay = next_sleep_seconds(db, time(NULL));
+        struct timespec sleep_time = {(time_t)delay, 0};
+        while (!stop_requested && !reload_requested && !child_changed &&
+               nanosleep(&sleep_time, &sleep_time) < 0 && errno == EINTR) {
+        }
+        reload_requested = 0;
+        reap_children(db, 0);
+        reconcile_running(db);
+        if (!stop_requested && !process_due_jobs(db, time(NULL))) return 0;
+    }
+
+    fprintf(stderr, "draining active jobs...\n");
+    reap_children(db, 1);
+    return 1;
+}
+
+static void install_signal_handlers(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = handle_signal;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGTERM, &action, NULL);
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGHUP, &action, NULL);
+    sigaction(SIGCHLD, &action, NULL);
+}
+
+static void print_usage(const char* program) {
+    fprintf(stderr,
+        "usage: %s [--db PATH] COMMAND [ARGS]\n"
+        "commands:\n"
+        "  daemon\n"
+        "  run-once\n"
+        "  add ID CRON POLICY MAX_OVERLAP COMMAND...\n"
+        "  list\n"
+        "  remove ID\n"
+        "  runs [ID]\n",
+        program);
+}
+
+int main(int argc, char** argv) {
+    const char* database_path = "scheduler.db";
+    int index = 1;
+    if (index < argc && strcmp(argv[index], "--db") == 0) {
+        if (++index >= argc) {
+            print_usage(argv[0]);
+            return 2;
+        }
+        database_path = argv[index++];
+    }
+    if (index >= argc) {
+        print_usage(argv[0]);
+        return 2;
+    }
+
+    sqlite3* db = open_database(database_path);
+    if (!db) return 1;
+    const char* command = argv[index++];
+    int ok;
+
+    if (strcmp(command, "add") == 0) {
+        ok = add_job(db, argc, argv, index);
+    } else if (strcmp(command, "list") == 0 && index == argc) {
+        ok = list_jobs(db);
+    } else if (strcmp(command, "remove") == 0 && index + 1 == argc) {
+        ok = remove_job(db, argv[index]);
+    } else if (strcmp(command, "runs") == 0 && index + 1 >= argc) {
+        ok = list_runs(db, index < argc ? argv[index] : NULL);
+    } else if ((strcmp(command, "daemon") == 0 ||
+                strcmp(command, "run-once") == 0) && index == argc) {
+        install_signal_handlers();
+        ok = run_scheduler(db, strcmp(command, "run-once") == 0);
+    } else {
+        print_usage(argv[0]);
+        ok = 0;
+    }
+
+    sqlite3_close(db);
+    return ok ? 0 : 1;
 }
