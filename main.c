@@ -191,6 +191,36 @@ static int days_in_month(int year, int month) {
     return DAYS_PER_MONTH[month - 1];
 }
 
+static int shift_minutes(struct datetime* date, long long offset) {
+    long long minute_of_day =
+        (long long)date->hour * 60 + date->minute + offset;
+
+    while (minute_of_day < 0) {
+        minute_of_day += 24 * 60;
+        if (--date->day < 1) {
+            if (--date->month < 1) {
+                if (--date->year < 1) return 0;
+                date->month = 12;
+            }
+            date->day = days_in_month(date->year, date->month);
+        }
+    }
+    while (minute_of_day >= 24 * 60) {
+        minute_of_day -= 24 * 60;
+        if (++date->day > days_in_month(date->year, date->month)) {
+            date->day = 1;
+            if (++date->month > 12) {
+                if (++date->year > 9999) return 0;
+                date->month = 1;
+            }
+        }
+    }
+
+    date->hour = (int)(minute_of_day / 60);
+    date->minute = (int)(minute_of_day % 60);
+    return 1;
+}
+
 static void add_minute(struct datetime* date) {
     date->second = 0;
     if (++date->minute < 60) return;
@@ -243,21 +273,38 @@ int main(void) {
 
     while (fgets(line, sizeof line, stdin)) {
         char fields[5][64];
-        char separator, iso[64], trailing;
-        int parsed = sscanf(line, " %63s %63s %63s %63s %63s %c %63s %c",
+        char first_separator, second_separator, iso[64], trailing;
+        int offset;
+        int parsed = sscanf(line,
+                            " %63s %63s %63s %63s %63s %c %63s %c %d %c",
                             fields[0], fields[1], fields[2], fields[3], fields[4],
-                            &separator, iso, &trailing);
-        struct datetime after, next;
+                            &first_separator, iso, &second_separator, &offset,
+                            &trailing);
+        struct datetime after_utc, after_local, next_local, next_utc;
         struct cron_schedule cron;
 
-        if (parsed != 7 || separator != '|' ||
-            !parse_datetime(iso, &after) || !parse_cron(fields, &cron) ||
-            !next_run(&cron, &after, &next)) {
+        if (parsed != 9 || first_separator != '|' || second_separator != '|' ||
+            offset < -24 * 60 || offset > 24 * 60 ||
+            !parse_datetime(iso, &after_utc) || !parse_cron(fields, &cron)) {
+            printf("NEVER\n");
+            continue;
+        }
+
+        after_local = after_utc;
+        if (!shift_minutes(&after_local, offset) ||
+            !next_run(&cron, &after_local, &next_local)) {
+            printf("NEVER\n");
+            continue;
+        }
+
+        next_utc = next_local;
+        if (!shift_minutes(&next_utc, -(long long)offset)) {
             printf("NEVER\n");
             continue;
         }
         printf("%04d-%02d-%02dT%02d:%02d:00\n",
-               next.year, next.month, next.day, next.hour, next.minute);
+               next_utc.year, next_utc.month, next_utc.day,
+               next_utc.hour, next_utc.minute);
     }
     return 0;
 }
