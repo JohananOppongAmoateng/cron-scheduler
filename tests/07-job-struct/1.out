@@ -1,0 +1,2 @@
+OK
+backup|0 3 * * *|pg_dump prod|2025-03-17T03:00:00

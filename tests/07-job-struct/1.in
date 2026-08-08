@@ -1,0 +1,2 @@
+ADD backup "0 3 * * *" pg_dump prod
+LIST

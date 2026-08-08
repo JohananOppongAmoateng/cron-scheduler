@@ -1,0 +1,58 @@
+{
+  "course": "build-cron-scheduler",
+  "language": "c",
+  "language_id": 50,
+  "entrypoint": "main.c",
+  "version": 1,
+  "content_hash": "61ab217d6e3006a4",
+  "lessons": [
+    {
+      "slug": "cron-tokenize",
+      "tests_hash": "d1b7299a21c6"
+    },
+    {
+      "slug": "cron-fields",
+      "tests_hash": "63d602ba8654"
+    },
+    {
+      "slug": "field-match",
+      "tests_hash": "f62ae5e1552b"
+    },
+    {
+      "slug": "next-run",
+      "tests_hash": "cf14f02779b9"
+    },
+    {
+      "slug": "tz-dst",
+      "tests_hash": "73dbc224189b"
+    },
+    {
+      "slug": "iter-next",
+      "tests_hash": "90417b343e03"
+    },
+    {
+      "slug": "job-struct",
+      "tests_hash": "4360c2059773"
+    },
+    {
+      "slug": "min-heap",
+      "tests_hash": "e1214bff0349"
+    },
+    {
+      "slug": "exec-loop",
+      "tests_hash": "c0aebb155fb4"
+    },
+    {
+      "slug": "missed-jobs",
+      "tests_hash": "9bc1836880c1"
+    },
+    {
+      "slug": "overlap-prevention",
+      "tests_hash": "fb6bed281e46"
+    },
+    {
+      "slug": "full-daemon",
+      "tests_hash": "0966d8e9b8f2"
+    }
+  ]
+}

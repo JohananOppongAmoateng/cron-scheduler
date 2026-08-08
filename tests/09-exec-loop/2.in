@@ -1,0 +1,5 @@
+NOW 2025-03-17T08:59:00
+ADD heart "* * * * *" beat
+TICK
+NOW 2025-03-17T09:01:00
+TICK
