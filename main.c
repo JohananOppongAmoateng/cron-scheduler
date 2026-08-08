@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <ctype.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -238,41 +239,166 @@ static int next_run(const struct cron_schedule* cron,
     return 0;
 }
 
+struct job {
+    char id[64];
+    char cron_text[256];
+    char command[512];
+    struct cron_schedule cron;
+};
+
+static int parse_cron_text(const char* text, struct cron_schedule* cron) {
+    char fields[5][64], trailing;
+    if (sscanf(text, " %63s %63s %63s %63s %63s %c",
+               fields[0], fields[1], fields[2], fields[3], fields[4],
+               &trailing) != 5) {
+        return 0;
+    }
+    return parse_cron(fields, cron);
+}
+
+static int find_job(const struct job* jobs, size_t count, const char* id) {
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(jobs[i].id, id) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static int compare_job_ids(const void* left, const void* right) {
+    const struct job* const* a = left;
+    const struct job* const* b = right;
+    return strcmp((*a)->id, (*b)->id);
+}
+
+static void print_next_run(const struct job* job,
+                           const struct datetime* now) {
+    struct datetime next;
+    if (!next_run(&job->cron, now, &next)) {
+        printf("NEVER");
+        return;
+    }
+    printf("%04d-%02d-%02dT%02d:%02d:00",
+           next.year, next.month, next.day, next.hour, next.minute);
+}
+
 int main(void) {
     char line[512];
-    int first_expression = 1;
+    struct job* jobs = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    struct datetime now;
+    parse_datetime("2025-03-17T00:00:00", &now);
 
     while (fgets(line, sizeof line, stdin)) {
-        char fields[5][64];
-        char first_separator, second_separator, iso[64], trailing;
-        int count;
-        int parsed = sscanf(line,
-                            " %63s %63s %63s %63s %63s %c %63s %c %d %c",
-                            fields[0], fields[1], fields[2], fields[3], fields[4],
-                            &first_separator, iso, &second_separator, &count,
-                            &trailing);
-        struct datetime after, next;
-        struct cron_schedule cron;
+        line[strcspn(line, "\r\n")] = '\0';
 
-        if (!first_expression) printf("\n");
-        first_expression = 0;
+        if (strncmp(line, "ADD", 3) == 0 && isspace((unsigned char)line[3])) {
+            char* p = line + 3;
+            while (isspace((unsigned char)*p)) p++;
+            char* id = p;
+            while (*p && !isspace((unsigned char)*p)) p++;
+            if (*p) *p++ = '\0';
+            while (isspace((unsigned char)*p)) p++;
 
-        if (parsed != 9 || first_separator != '|' || second_separator != '|' ||
-            count < 0 || !parse_datetime(iso, &after) ||
-            !parse_cron(fields, &cron)) {
-            printf("NEVER\n");
+            if (*id == '\0' || strlen(id) >= sizeof jobs[0].id || *p != '"') {
+                printf("ERR\n");
+                continue;
+            }
+            char* cron_text = ++p;
+            char* quote = strchr(p, '"');
+            if (!quote) {
+                printf("ERR\n");
+                continue;
+            }
+            *quote = '\0';
+            p = quote + 1;
+            if (*p && !isspace((unsigned char)*p)) {
+                printf("ERR\n");
+                continue;
+            }
+            while (isspace((unsigned char)*p)) p++;
+            char* command = p;
+
+            struct cron_schedule cron;
+            if (*command == '\0' ||
+                strlen(cron_text) >= sizeof jobs[0].cron_text ||
+                strlen(command) >= sizeof jobs[0].command ||
+                !parse_cron_text(cron_text, &cron)) {
+                printf("ERR\n");
+                continue;
+            }
+
+            int index = find_job(jobs, count, id);
+            if (index < 0) {
+                if (count == capacity) {
+                    size_t new_capacity = capacity ? capacity * 2 : 8;
+                    struct job* resized =
+                        realloc(jobs, new_capacity * sizeof *jobs);
+                    if (!resized) {
+                        printf("ERR\n");
+                        continue;
+                    }
+                    jobs = resized;
+                    capacity = new_capacity;
+                }
+                index = (int)count++;
+            }
+
+            snprintf(jobs[index].id, sizeof jobs[index].id, "%s", id);
+            snprintf(jobs[index].cron_text, sizeof jobs[index].cron_text,
+                     "%s", cron_text);
+            snprintf(jobs[index].command, sizeof jobs[index].command,
+                     "%s", command);
+            jobs[index].cron = cron;
+            printf("OK\n");
             continue;
         }
 
-        for (int i = 0; i < count; i++) {
-            if (!next_run(&cron, &after, &next)) {
-                printf("NEVER\n");
-                break;
+        if (strcmp(line, "LIST") == 0) {
+            struct job** sorted = malloc(count * sizeof *sorted);
+            if (!sorted && count != 0) {
+                printf("ERR\n");
+                continue;
             }
-            printf("%04d-%02d-%02dT%02d:%02d:00\n",
-                   next.year, next.month, next.day, next.hour, next.minute);
-            after = next;
+            for (size_t i = 0; i < count; i++) sorted[i] = &jobs[i];
+            if (count > 1) {
+                qsort(sorted, count, sizeof *sorted, compare_job_ids);
+            }
+            for (size_t i = 0; i < count; i++) {
+                printf("%s|%s|%s|", sorted[i]->id, sorted[i]->cron_text,
+                       sorted[i]->command);
+                print_next_run(sorted[i], &now);
+                printf("\n");
+            }
+            free(sorted);
+            continue;
         }
+
+        char id[64], trailing;
+        if (sscanf(line, "REMOVE %63s %c", id, &trailing) == 1) {
+            int index = find_job(jobs, count, id);
+            if (index < 0) {
+                printf("ERR no such job\n");
+                continue;
+            }
+            jobs[index] = jobs[count - 1];
+            count--;
+            printf("OK\n");
+            continue;
+        }
+
+        if (sscanf(line, "NEXT %63s %c", id, &trailing) == 1) {
+            int index = find_job(jobs, count, id);
+            if (index < 0) {
+                printf("ERR\n");
+                continue;
+            }
+            print_next_run(&jobs[index], &now);
+            printf("\n");
+            continue;
+        }
+
+        printf("ERR\n");
     }
+    free(jobs);
     return 0;
 }
