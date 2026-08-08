@@ -14,29 +14,19 @@ struct cron {
     int day_wildcard, weekday_wildcard;
 };
 
-enum policy {
-    POLICY_SKIP,
-    POLICY_CATCHUP,
-    POLICY_LIMITED
-};
-
 struct job {
     char id[64];
     char command[256];
     struct cron cron;
     struct datetime next;
-    enum policy policy;
-    size_t catchup_limit;
+    int active;
+    int max_overlap;
+    int skipped;
 };
 
 struct heap {
     size_t* items;
     size_t size, capacity;
-};
-
-struct run_event {
-    size_t job_index;
-    struct datetime at;
 };
 
 static int parse_number(const char* text, int* value) {
@@ -173,6 +163,24 @@ static void add_minute(struct datetime* date) {
     date->year++;
 }
 
+static void add_seconds(struct datetime* date, int seconds) {
+    long long second_of_day = (long long)date->hour * 3600 +
+                              date->minute * 60 + date->second + seconds;
+    while (second_of_day >= 24 * 3600) {
+        second_of_day -= 24 * 3600;
+        if (++date->day > days_in_month(date->year, date->month)) {
+            date->day = 1;
+            if (++date->month > 12) {
+                date->month = 1;
+                date->year++;
+            }
+        }
+    }
+    date->hour = (int)(second_of_day / 3600);
+    date->minute = (int)(second_of_day % 3600 / 60);
+    date->second = (int)(second_of_day % 60);
+}
+
 static int weekday(const struct datetime* date) {
     static const int offsets[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
     int year = date->year - (date->month < 3);
@@ -262,35 +270,11 @@ static size_t heap_pop(struct heap* heap, const struct job* jobs) {
     return result;
 }
 
-static int append_event(struct run_event** events, size_t* count,
-                        size_t* capacity, size_t job_index,
-                        const struct datetime* at) {
-    if (*count == *capacity) {
-        size_t new_capacity = *capacity ? *capacity * 2 : 8;
-        struct run_event* resized =
-            realloc(*events, new_capacity * sizeof **events);
-        if (!resized) return 0;
-        *events = resized;
-        *capacity = new_capacity;
+static int find_job(const struct job* jobs, size_t count, const char* id) {
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(jobs[i].id, id) == 0) return (int)i;
     }
-    (*events)[*count].job_index = job_index;
-    (*events)[*count].at = *at;
-    (*count)++;
-    return 1;
-}
-
-static int compare_events(const void* left, const void* right) {
-    const struct run_event* a = left;
-    const struct run_event* b = right;
-    int by_time = compare_datetime(&a->at, &b->at);
-    if (by_time) return by_time;
-    return a->job_index < b->job_index ? -1 : a->job_index > b->job_index;
-}
-
-static void print_datetime(const struct datetime* date) {
-    printf("%04d-%02d-%02dT%02d:%02d:%02d",
-           date->year, date->month, date->day,
-           date->hour, date->minute, date->second);
+    return -1;
 }
 
 int main(void) {
@@ -332,7 +316,7 @@ int main(void) {
             *quote = '\0';
             p = quote + 1;
             while (isspace((unsigned char)*p)) p++;
-            char* policy_text = p;
+            char* overlap_text = p;
             while (*p && !isspace((unsigned char)*p)) p++;
             if (*p) *p++ = '\0';
             while (isspace((unsigned char)*p)) p++;
@@ -351,29 +335,18 @@ int main(void) {
             struct job* job = &jobs[job_count];
             snprintf(job->id, sizeof job->id, "%s", id);
             snprintf(job->command, sizeof job->command, "%s", p);
-            if (strcmp(policy_text, "skip") == 0) {
-                job->policy = POLICY_SKIP;
-                job->catchup_limit = 1;
-            } else if (strcmp(policy_text, "catchup") == 0) {
-                job->policy = POLICY_CATCHUP;
-                job->catchup_limit = 0;
-            } else if (strncmp(policy_text, "catchup:", 8) == 0) {
-                int limit;
-                if (!parse_number(policy_text + 8, &limit) || limit < 0) {
-                    printf("ERR\n");
-                    continue;
-                }
-                job->policy = POLICY_LIMITED;
-                job->catchup_limit = (size_t)limit;
-            } else {
+            if (!parse_number(overlap_text, &job->max_overlap) ||
+                job->max_overlap < 0 || *p == '\0' ||
+                !parse_cron(cron_text, &job->cron)) {
                 printf("ERR\n");
                 continue;
             }
-            if (*p == '\0' || !parse_cron(cron_text, &job->cron)) {
-                printf("ERR\n");
-                continue;
-            }
-            if (!next_run(&job->cron, &now, &job->next)) {
+            job->active = 0;
+            job->skipped = 0;
+            if (cron_matches(&job->cron, &now)) {
+                job->next = now;
+                job->next.second = 0;
+            } else if (!next_run(&job->cron, &now, &job->next)) {
                 printf("ERR\n");
                 continue;
             }
@@ -382,95 +355,57 @@ int main(void) {
                 continue;
             }
             job_count++;
-        } else if (strcmp(line, "TICK") == 0) {
-            if (!has_now) {
+        } else if (strncmp(line, "RUN_TICK ", 9) == 0) {
+            int duration;
+            char trailing;
+            if (!has_now ||
+                sscanf(line, "RUN_TICK %d %c", &duration, &trailing) != 1 ||
+                duration < 0) {
                 printf("ERR\n");
                 continue;
             }
-            struct run_event* events = NULL;
-            size_t event_count = 0, event_capacity = 0;
             while (heap.size &&
                    compare_datetime(&jobs[heap.items[0]].next, &now) <= 0) {
                 size_t index = heap_pop(&heap, jobs);
                 struct job* job = &jobs[index];
-                struct datetime scheduled = job->next;
-                struct datetime latest = scheduled;
-                struct datetime* recent = NULL;
-                size_t missed_count = 0;
-
-                if (job->policy == POLICY_LIMITED && job->catchup_limit) {
-                    recent = malloc(job->catchup_limit * sizeof *recent);
-                    if (!recent) {
-                        free(events);
-                        free(heap.items);
-                        free(jobs);
-                        return 1;
-                    }
+                if (job->active < job->max_overlap) {
+                    job->active++;
+                    printf("RAN %s\n", job->id);
+                } else {
+                    job->skipped++;
+                    printf("SKIP %s\n", job->id);
                 }
-
-                while (compare_datetime(&scheduled, &now) <= 0) {
-                    latest = scheduled;
-                    if (job->policy == POLICY_CATCHUP &&
-                        !append_event(&events, &event_count, &event_capacity,
-                                      index, &scheduled)) {
-                        free(recent);
-                        free(events);
-                        free(heap.items);
-                        free(jobs);
-                        return 1;
-                    }
-                    if (job->policy == POLICY_LIMITED &&
-                        job->catchup_limit) {
-                        recent[missed_count % job->catchup_limit] = scheduled;
-                    }
-                    missed_count++;
-                    if (!next_run(&job->cron, &scheduled, &job->next)) break;
-                    scheduled = job->next;
-                }
-
-                if (job->policy == POLICY_SKIP && missed_count &&
-                    !append_event(&events, &event_count, &event_capacity,
-                                  index, &latest)) {
-                    free(recent);
-                    free(events);
-                    free(heap.items);
-                    free(jobs);
-                    return 1;
-                }
-                if (job->policy == POLICY_LIMITED && job->catchup_limit) {
-                    size_t kept = missed_count < job->catchup_limit
-                                      ? missed_count : job->catchup_limit;
-                    size_t start = missed_count < job->catchup_limit
-                                       ? 0 : missed_count % job->catchup_limit;
-                    for (size_t i = 0; i < kept; i++) {
-                        struct datetime* occurrence =
-                            &recent[(start + i) % job->catchup_limit];
-                        if (!append_event(&events, &event_count,
-                                          &event_capacity, index, occurrence)) {
-                            free(recent);
-                            free(events);
-                            free(heap.items);
-                            free(jobs);
-                            return 1;
-                        }
-                    }
-                }
-                free(recent);
-
-                if (compare_datetime(&job->next, &now) > 0) {
+                if (next_run(&job->cron, &now, &job->next)) {
                     heap_push(&heap, index, jobs);
                 }
             }
-            if (event_count > 1) {
-                qsort(events, event_count, sizeof *events, compare_events);
+            add_seconds(&now, duration);
+        } else if (strncmp(line, "COMPLETE ", 9) == 0) {
+            char id[64], trailing;
+            if (sscanf(line, "COMPLETE %63s %c", id, &trailing) != 1) {
+                printf("ERR\n");
+                continue;
             }
-            for (size_t i = 0; i < event_count; i++) {
-                printf("RAN %s for ", jobs[events[i].job_index].id);
-                print_datetime(&events[i].at);
-                printf("\n");
+            int index = find_job(jobs, job_count, id);
+            if (index < 0) {
+                printf("ERR\n");
+            } else if (jobs[index].active > 0) {
+                jobs[index].active--;
             }
-            free(events);
-            printf("OK\n");
+        } else if (strncmp(line, "STATUS ", 7) == 0) {
+            char id[64], trailing;
+            if (sscanf(line, "STATUS %63s %c", id, &trailing) != 1) {
+                printf("ERR\n");
+                continue;
+            }
+            int index = find_job(jobs, job_count, id);
+            if (index < 0) {
+                printf("ERR\n");
+            } else {
+                printf("%s active=%d max=%d skipped=%d\n",
+                       jobs[index].id, jobs[index].active,
+                       jobs[index].max_overlap, jobs[index].skipped);
+            }
         } else {
             printf("ERR\n");
         }
