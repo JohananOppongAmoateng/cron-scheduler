@@ -203,7 +203,8 @@ static int next_run(const struct cron* cron, const struct datetime* after,
 
 static int heap_compare(size_t a, size_t b, const struct job* jobs) {
     int by_time = compare_datetime(&jobs[a].next, &jobs[b].next);
-    return by_time ? by_time : strcmp(jobs[a].id, jobs[b].id);
+    if (by_time) return by_time;
+    return a < b ? -1 : a > b;
 }
 
 static int heap_push(struct heap* heap, size_t job_index,
@@ -332,9 +333,18 @@ int main(void) {
             struct job* job = &jobs[job_count];
             snprintf(job->id, sizeof job->id, "%s", id);
             snprintf(job->command, sizeof job->command, "%s", p);
-            if (!parse_cron(cron_text, &job->cron) ||
-                !next_run(&job->cron, &now, &job->next) ||
-                !heap_push(&heap, job_count, jobs)) {
+            if (!parse_cron(cron_text, &job->cron)) {
+                printf("ERR\n");
+                continue;
+            }
+            if (cron_matches(&job->cron, &now)) {
+                job->next = now;
+                job->next.second = 0;
+            } else if (!next_run(&job->cron, &now, &job->next)) {
+                printf("ERR\n");
+                continue;
+            }
+            if (!heap_push(&heap, job_count, jobs)) {
                 printf("ERR\n");
                 continue;
             }
@@ -343,10 +353,6 @@ int main(void) {
             if (!has_now) {
                 printf("ERR\n");
                 continue;
-            }
-            if (heap.size &&
-                compare_datetime(&jobs[heap.items[0]].next, &now) > 0) {
-                now = jobs[heap.items[0]].next;
             }
             while (heap.size &&
                    compare_datetime(&jobs[heap.items[0]].next, &now) <= 0) {
