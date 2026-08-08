@@ -138,36 +138,104 @@ static int day_of_week(const struct datetime* date) {
             OFFSETS[date->month - 1] + date->day) % 7;
 }
 
-static int matches_cron(char fields[5][64], const struct datetime* date) {
-    unsigned char minutes[60] = {0};
-    unsigned char hours[24] = {0};
-    unsigned char month_days[31] = {0};
-    unsigned char months[12] = {0};
-    unsigned char week_days[8] = {0};
-    int dom_wildcard = strcmp(fields[2], "*") == 0;
-    int dow_wildcard = strcmp(fields[4], "*") == 0;
+struct cron_schedule {
+    unsigned char minutes[60];
+    unsigned char hours[24];
+    unsigned char month_days[31];
+    unsigned char months[12];
+    unsigned char week_days[8];
+    int dom_wildcard;
+    int dow_wildcard;
+};
 
-    if (expand_field(fields[0], 0, 59, minutes) != OK ||
-        expand_field(fields[1], 0, 23, hours) != OK ||
-        expand_field(fields[2], 1, 31, month_days) != OK ||
-        expand_field(fields[3], 1, 12, months) != OK ||
-        expand_field(fields[4], 0, 7, week_days) != OK) {
+static int parse_cron(char fields[5][64], struct cron_schedule* cron) {
+    memset(cron, 0, sizeof *cron);
+    cron->dom_wildcard = strcmp(fields[2], "*") == 0;
+    cron->dow_wildcard = strcmp(fields[4], "*") == 0;
+
+    if (expand_field(fields[0], 0, 59, cron->minutes) != OK ||
+        expand_field(fields[1], 0, 23, cron->hours) != OK ||
+        expand_field(fields[2], 1, 31, cron->month_days) != OK ||
+        expand_field(fields[3], 1, 12, cron->months) != OK ||
+        expand_field(fields[4], 0, 7, cron->week_days) != OK) {
         return 0;
     }
-
-    if (!minutes[date->minute] || !hours[date->hour] ||
-        !months[date->month - 1]) {
-        return 0;
-    }
-
-    int dom_matches = month_days[date->day - 1];
-    int weekday = day_of_week(date);
-    int dow_matches = week_days[weekday] || (weekday == 0 && week_days[7]);
-
-    if (!dom_wildcard && !dow_wildcard) return dom_matches || dow_matches;
-    if (!dom_wildcard) return dom_matches;
-    if (!dow_wildcard) return dow_matches;
     return 1;
+}
+
+static int matches_cron(const struct cron_schedule* cron,
+                        const struct datetime* date) {
+    if (!cron->minutes[date->minute] || !cron->hours[date->hour] ||
+        !cron->months[date->month - 1]) {
+        return 0;
+    }
+
+    int dom_matches = cron->month_days[date->day - 1];
+    int weekday = day_of_week(date);
+    int dow_matches = cron->week_days[weekday] ||
+                      (weekday == 0 && cron->week_days[7]);
+
+    if (!cron->dom_wildcard && !cron->dow_wildcard) {
+        return dom_matches || dow_matches;
+    }
+    if (!cron->dom_wildcard) return dom_matches;
+    if (!cron->dow_wildcard) return dow_matches;
+    return 1;
+}
+
+static int days_in_month(int year, int month) {
+    static const int DAYS_PER_MONTH[] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+    if (month == 2 && is_leap_year(year)) return 29;
+    return DAYS_PER_MONTH[month - 1];
+}
+
+static void add_minute(struct datetime* date) {
+    date->second = 0;
+    if (++date->minute < 60) return;
+    date->minute = 0;
+    if (++date->hour < 24) return;
+    date->hour = 0;
+    if (++date->day <= days_in_month(date->year, date->month)) return;
+    date->day = 1;
+    if (++date->month <= 12) return;
+    date->month = 1;
+    date->year++;
+}
+
+static int compare_datetime(const struct datetime* left,
+                            const struct datetime* right) {
+    if (left->year != right->year) return left->year < right->year ? -1 : 1;
+    if (left->month != right->month) return left->month < right->month ? -1 : 1;
+    if (left->day != right->day) return left->day < right->day ? -1 : 1;
+    if (left->hour != right->hour) return left->hour < right->hour ? -1 : 1;
+    if (left->minute != right->minute) {
+        return left->minute < right->minute ? -1 : 1;
+    }
+    if (left->second != right->second) {
+        return left->second < right->second ? -1 : 1;
+    }
+    return 0;
+}
+
+static int next_run(const struct cron_schedule* cron,
+                    const struct datetime* after,
+                    struct datetime* next) {
+    *next = *after;
+    add_minute(next);
+
+    struct datetime limit = *after;
+    if (limit.year > 9995) return 0;
+    limit.year += 4;
+    int last_day = days_in_month(limit.year, limit.month);
+    if (limit.day > last_day) limit.day = last_day;
+
+    while (compare_datetime(next, &limit) <= 0) {
+        if (matches_cron(cron, next)) return 1;
+        add_minute(next);
+    }
+    return 0;
 }
 
 int main(void) {
@@ -179,13 +247,17 @@ int main(void) {
         int parsed = sscanf(line, " %63s %63s %63s %63s %63s %c %63s %c",
                             fields[0], fields[1], fields[2], fields[3], fields[4],
                             &separator, iso, &trailing);
-        struct datetime date;
+        struct datetime after, next;
+        struct cron_schedule cron;
 
-        if (parsed != 7 || separator != '|' || !parse_datetime(iso, &date)) {
-            printf("NO\n");
+        if (parsed != 7 || separator != '|' ||
+            !parse_datetime(iso, &after) || !parse_cron(fields, &cron) ||
+            !next_run(&cron, &after, &next)) {
+            printf("NEVER\n");
             continue;
         }
-        printf("%s\n", matches_cron(fields, &date) ? "YES" : "NO");
+        printf("%04d-%02d-%02dT%02d:%02d:00\n",
+               next.year, next.month, next.day, next.hour, next.minute);
     }
     return 0;
 }
