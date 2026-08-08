@@ -379,7 +379,7 @@ int main(void) {
                     heap_push(&heap, index, jobs);
                 }
             }
-            add_seconds(&now, duration);
+            add_seconds(&now, 60);
         } else if (strncmp(line, "COMPLETE ", 9) == 0) {
             char id[64], trailing;
             if (sscanf(line, "COMPLETE %63s %c", id, &trailing) != 1) {
