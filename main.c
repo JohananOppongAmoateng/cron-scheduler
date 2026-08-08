@@ -14,19 +14,24 @@ struct cron {
     int day_wildcard, weekday_wildcard;
 };
 
-struct job {
-    char id[64];
-    char command[256];
-    struct cron cron;
-    struct datetime next;
-    int active;
-    int max_overlap;
-    int skipped;
+enum policy {
+    POLICY_SKIP,
+    POLICY_CATCHUP,
+    POLICY_LIMITED
 };
 
-struct heap {
-    size_t* items;
-    size_t size, capacity;
+struct job {
+    char id[64];
+    char cron_text[256];
+    char command[256];
+    struct cron cron;
+    enum policy policy;
+    size_t catchup_limit;
+    int active;
+    int max_overlap;
+    struct datetime added_at;
+    struct datetime last_processed;
+    int has_last_processed;
 };
 
 static int parse_number(const char* text, int* value) {
@@ -163,24 +168,6 @@ static void add_minute(struct datetime* date) {
     date->year++;
 }
 
-static void add_seconds(struct datetime* date, int seconds) {
-    long long second_of_day = (long long)date->hour * 3600 +
-                              date->minute * 60 + date->second + seconds;
-    while (second_of_day >= 24 * 3600) {
-        second_of_day -= 24 * 3600;
-        if (++date->day > days_in_month(date->year, date->month)) {
-            date->day = 1;
-            if (++date->month > 12) {
-                date->month = 1;
-                date->year++;
-            }
-        }
-    }
-    date->hour = (int)(second_of_day / 3600);
-    date->minute = (int)(second_of_day % 3600 / 60);
-    date->second = (int)(second_of_day % 60);
-}
-
 static int weekday(const struct datetime* date) {
     static const int offsets[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
     int year = date->year - (date->month < 3);
@@ -217,64 +204,96 @@ static int next_run(const struct cron* cron, const struct datetime* after,
     return 0;
 }
 
-static int heap_compare(size_t a, size_t b, const struct job* jobs) {
-    int by_time = compare_datetime(&jobs[a].next, &jobs[b].next);
-    if (by_time) return by_time;
-    return a < b ? -1 : a > b;
-}
-
-static int heap_push(struct heap* heap, size_t job_index,
-                     const struct job* jobs) {
-    if (heap->size == heap->capacity) {
-        size_t capacity = heap->capacity ? heap->capacity * 2 : 8;
-        size_t* resized = realloc(heap->items, capacity * sizeof *heap->items);
-        if (!resized) return 0;
-        heap->items = resized;
-        heap->capacity = capacity;
-    }
-    size_t index = heap->size++;
-    heap->items[index] = job_index;
-    while (index) {
-        size_t parent = (index - 1) / 2;
-        if (heap_compare(heap->items[parent], heap->items[index], jobs) <= 0) {
-            break;
-        }
-        size_t temporary = heap->items[parent];
-        heap->items[parent] = heap->items[index];
-        heap->items[index] = temporary;
-        index = parent;
-    }
-    return 1;
-}
-
-static size_t heap_pop(struct heap* heap, const struct job* jobs) {
-    size_t result = heap->items[0];
-    heap->items[0] = heap->items[--heap->size];
-    size_t index = 0;
-    for (;;) {
-        size_t left = index * 2 + 1, right = left + 1, smallest = index;
-        if (left < heap->size &&
-            heap_compare(heap->items[left], heap->items[smallest], jobs) < 0) {
-            smallest = left;
-        }
-        if (right < heap->size &&
-            heap_compare(heap->items[right], heap->items[smallest], jobs) < 0) {
-            smallest = right;
-        }
-        if (smallest == index) break;
-        size_t temporary = heap->items[index];
-        heap->items[index] = heap->items[smallest];
-        heap->items[smallest] = temporary;
-        index = smallest;
-    }
-    return result;
-}
-
 static int find_job(const struct job* jobs, size_t count, const char* id) {
     for (size_t i = 0; i < count; i++) {
         if (strcmp(jobs[i].id, id) == 0) return (int)i;
     }
     return -1;
+}
+
+static void print_datetime(const struct datetime* date) {
+    printf("%04d-%02d-%02dT%02d:%02d:%02d",
+           date->year, date->month, date->day,
+           date->hour, date->minute, date->second);
+}
+
+static int parse_job_args(char* text, const struct datetime* now,
+                          struct job* job) {
+    char* p = text;
+    while (isspace((unsigned char)*p)) p++;
+    char* id = p;
+    while (*p && !isspace((unsigned char)*p)) p++;
+    if (*p) *p++ = '\0';
+    while (isspace((unsigned char)*p)) p++;
+    if (*id == '\0' || strlen(id) >= sizeof job->id || *p != '"') return 0;
+
+    char* cron_text = ++p;
+    char* quote = strchr(p, '"');
+    if (!quote) return 0;
+    *quote = '\0';
+    p = quote + 1;
+    while (isspace((unsigned char)*p)) p++;
+
+    char* policy_text = p;
+    while (*p && !isspace((unsigned char)*p)) p++;
+    if (*p) *p++ = '\0';
+    while (isspace((unsigned char)*p)) p++;
+
+    char* overlap_text = p;
+    while (*p && !isspace((unsigned char)*p)) p++;
+    if (*p) *p++ = '\0';
+    while (isspace((unsigned char)*p)) p++;
+
+    if (strcmp(policy_text, "skip") == 0) {
+        job->policy = POLICY_SKIP;
+        job->catchup_limit = 1;
+    } else if (strcmp(policy_text, "catchup") == 0) {
+        job->policy = POLICY_CATCHUP;
+        job->catchup_limit = 0;
+    } else if (strncmp(policy_text, "catchup:", 8) == 0) {
+        int limit;
+        if (!parse_number(policy_text + 8, &limit) || limit < 0) return 0;
+        job->policy = POLICY_LIMITED;
+        job->catchup_limit = (size_t)limit;
+    } else {
+        return 0;
+    }
+
+    if (!parse_number(overlap_text, &job->max_overlap) ||
+        job->max_overlap <= 0 || *p == '\0' ||
+        strlen(cron_text) >= sizeof job->cron_text ||
+        strlen(p) >= sizeof job->command ||
+        !parse_cron(cron_text, &job->cron)) {
+        return 0;
+    }
+
+    snprintf(job->id, sizeof job->id, "%s", id);
+    snprintf(job->cron_text, sizeof job->cron_text, "%s", cron_text);
+    snprintf(job->command, sizeof job->command, "%s", p);
+    job->active = 0;
+    job->added_at = *now;
+    job->has_last_processed = 0;
+    return 1;
+}
+
+static int append_datetime(struct datetime** dates, size_t* count,
+                           size_t* capacity, const struct datetime* date) {
+    if (*count == *capacity) {
+        size_t new_capacity = *capacity ? *capacity * 2 : 8;
+        struct datetime* resized =
+            realloc(*dates, new_capacity * sizeof **dates);
+        if (!resized) return 0;
+        *dates = resized;
+        *capacity = new_capacity;
+    }
+    (*dates)[(*count)++] = *date;
+    return 1;
+}
+
+static int compare_job_pointers(const void* left, const void* right) {
+    const struct job* const* a = left;
+    const struct job* const* b = right;
+    return strcmp((*a)->id, (*b)->id);
 }
 
 int main(void) {
@@ -283,7 +302,6 @@ int main(void) {
     int has_now = 0;
     struct job* jobs = NULL;
     size_t job_count = 0, job_capacity = 0;
-    struct heap heap = {0};
 
     while (fgets(line, sizeof line, stdin)) {
         line[strcspn(line, "\r\n")] = '\0';
@@ -297,29 +315,10 @@ int main(void) {
                 has_now = 1;
             }
         } else if (strncmp(line, "ADD ", 4) == 0) {
-            char* p = line + 4;
-            while (isspace((unsigned char)*p)) p++;
-            char* id = p;
-            while (*p && !isspace((unsigned char)*p)) p++;
-            if (*p) *p++ = '\0';
-            while (isspace((unsigned char)*p)) p++;
-            if (!has_now || *id == '\0' || strlen(id) >= 64 || *p != '"') {
+            if (!has_now) {
                 printf("ERR\n");
                 continue;
             }
-            char* cron_text = ++p;
-            char* quote = strchr(p, '"');
-            if (!quote) {
-                printf("ERR\n");
-                continue;
-            }
-            *quote = '\0';
-            p = quote + 1;
-            while (isspace((unsigned char)*p)) p++;
-            char* overlap_text = p;
-            while (*p && !isspace((unsigned char)*p)) p++;
-            if (*p) *p++ = '\0';
-            while (isspace((unsigned char)*p)) p++;
 
             if (job_count == job_capacity) {
                 size_t capacity = job_capacity ? job_capacity * 2 : 8;
@@ -332,54 +331,62 @@ int main(void) {
                 jobs = resized;
                 job_capacity = capacity;
             }
-            struct job* job = &jobs[job_count];
-            snprintf(job->id, sizeof job->id, "%s", id);
-            snprintf(job->command, sizeof job->command, "%s", p);
-            if (!parse_number(overlap_text, &job->max_overlap) ||
-                job->max_overlap < 0 || *p == '\0' ||
-                !parse_cron(cron_text, &job->cron)) {
-                printf("ERR\n");
-                continue;
-            }
-            job->active = 0;
-            job->skipped = 0;
-            if (cron_matches(&job->cron, &now)) {
-                job->next = now;
-                job->next.second = 0;
-            } else if (!next_run(&job->cron, &now, &job->next)) {
-                printf("ERR\n");
-                continue;
-            }
-            if (!heap_push(&heap, job_count, jobs)) {
+            if (!parse_job_args(line + 4, &now, &jobs[job_count])) {
                 printf("ERR\n");
                 continue;
             }
             job_count++;
-        } else if (strncmp(line, "RUN_TICK ", 9) == 0) {
-            int duration;
-            char trailing;
-            if (!has_now ||
-                sscanf(line, "RUN_TICK %d %c", &duration, &trailing) != 1 ||
-                duration < 0) {
+        } else if (strcmp(line, "TICK") == 0) {
+            if (!has_now) {
                 printf("ERR\n");
                 continue;
             }
-            while (heap.size &&
-                   compare_datetime(&jobs[heap.items[0]].next, &now) <= 0) {
-                size_t index = heap_pop(&heap, jobs);
-                struct job* job = &jobs[index];
-                if (job->active < job->max_overlap) {
-                    job->active++;
-                    printf("RAN %s\n", job->id);
-                } else {
-                    job->skipped++;
-                    printf("SKIP %s\n", job->id);
+
+            for (size_t i = 0; i < job_count; i++) {
+                struct job* job = &jobs[i];
+                struct datetime cursor = job->has_last_processed
+                                             ? job->last_processed
+                                             : job->added_at;
+                struct datetime occurrence;
+                struct datetime* occurrences = NULL;
+                size_t count = 0, capacity = 0;
+
+                while (next_run(&job->cron, &cursor, &occurrence) &&
+                       compare_datetime(&occurrence, &now) <= 0) {
+                    if (!append_datetime(&occurrences, &count, &capacity,
+                                         &occurrence)) {
+                        free(occurrences);
+                        free(jobs);
+                        return 1;
+                    }
+                    cursor = occurrence;
                 }
-                if (next_run(&job->cron, &now, &job->next)) {
-                    heap_push(&heap, index, jobs);
+
+                size_t first = 0;
+                if (job->policy == POLICY_SKIP && count > 1) {
+                    first = count - 1;
+                } else if (job->policy == POLICY_LIMITED &&
+                           count > job->catchup_limit) {
+                    first = count - job->catchup_limit;
                 }
+
+                for (size_t j = first; j < count; j++) {
+                    if (job->active < job->max_overlap) {
+                        job->active++;
+                        printf("RAN %s for ", job->id);
+                    } else {
+                        printf("SKIP %s for ", job->id);
+                    }
+                    print_datetime(&occurrences[j]);
+                    printf("\n");
+                }
+                if (first < count) {
+                    job->last_processed = occurrences[count - 1];
+                    job->has_last_processed = 1;
+                }
+                free(occurrences);
             }
-            add_seconds(&now, 60);
+            printf("OK\n");
         } else if (strncmp(line, "COMPLETE ", 9) == 0) {
             char id[64], trailing;
             if (sscanf(line, "COMPLETE %63s %c", id, &trailing) != 1) {
@@ -392,26 +399,75 @@ int main(void) {
             } else if (jobs[index].active > 0) {
                 jobs[index].active--;
             }
-        } else if (strncmp(line, "STATUS ", 7) == 0) {
-            char id[64], trailing;
-            if (sscanf(line, "STATUS %63s %c", id, &trailing) != 1) {
+        } else if (strcmp(line, "PERSIST") == 0) {
+            struct job** sorted = malloc(job_count * sizeof *sorted);
+            if (!sorted && job_count) {
                 printf("ERR\n");
                 continue;
             }
-            int index = find_job(jobs, job_count, id);
-            if (index < 0) {
-                printf("ERR\n");
-            } else {
-                printf("%s active=%d max=%d skipped=%d\n",
-                       jobs[index].id, jobs[index].active,
-                       jobs[index].max_overlap, jobs[index].skipped);
+            for (size_t i = 0; i < job_count; i++) sorted[i] = &jobs[i];
+            if (job_count > 1) {
+                qsort(sorted, job_count, sizeof *sorted,
+                      compare_job_pointers);
             }
+            for (size_t i = 0; i < job_count; i++) {
+                struct datetime next;
+                printf("{\"id\":\"%s\",\"cron\":\"%s\",\"last_run\":",
+                       sorted[i]->id, sorted[i]->cron_text);
+                if (sorted[i]->has_last_processed) {
+                    printf("\"");
+                    print_datetime(&sorted[i]->last_processed);
+                    printf("\"");
+                } else {
+                    printf("null");
+                }
+                printf(",\"next_run\":\"");
+                if (next_run(&sorted[i]->cron, &now, &next)) {
+                    print_datetime(&next);
+                } else {
+                    printf("NEVER");
+                }
+                printf("\"}\n");
+            }
+            free(sorted);
+        } else if (strncmp(line, "RELOAD ", 7) == 0) {
+            int reload_count;
+            char trailing;
+            if (!has_now ||
+                sscanf(line, "RELOAD %d %c", &reload_count, &trailing) != 1 ||
+                reload_count < 0) {
+                printf("ERR\n");
+                continue;
+            }
+
+            free(jobs);
+            jobs = NULL;
+            job_count = 0;
+            job_capacity = (size_t)reload_count;
+            if (job_capacity) {
+                jobs = malloc(job_capacity * sizeof *jobs);
+                if (!jobs) return 1;
+            }
+
+            int valid = 1;
+            for (int i = 0; i < reload_count; i++) {
+                if (!fgets(line, sizeof line, stdin)) {
+                    valid = 0;
+                    break;
+                }
+                line[strcspn(line, "\r\n")] = '\0';
+                if (!parse_job_args(line, &now, &jobs[job_count])) {
+                    valid = 0;
+                } else {
+                    job_count++;
+                }
+            }
+            if (!valid) printf("ERR\n");
         } else {
             printf("ERR\n");
         }
     }
 
-    free(heap.items);
     free(jobs);
     return 0;
 }
